@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <strings.h>
 #include <fcntl.h>
+#include <stdlib.h>
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -44,6 +45,7 @@ void *Worker(void *arg);
 #define DESCRIPTORS_HINT 100    // Just a hint to the kernel.
 #define LISTENP 8080            // WebSockets port must be 80.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
+#define MAX_EVENTS 50           // Epoll max events.
 
 //-----------------------------------------------------------------------------
 // Entry point:
@@ -53,7 +55,8 @@ int main(int argc, char *argv[])
 
 {
     // Initializations:
-    int i, c = sysconf(_SC_NPROCESSORS_ONLN);   // Number of cores.
+    int i, j=0;                                 // For general use.
+    int c = sysconf(_SC_NPROCESSORS_ONLN);      // Number of cores.
     pthread_t thread = pthread_self();          // Main thread ID (myself).
     cpu_set_t cpuset;                           // Each bit represents a CPU.
     CORE_STRC core[c];                          // Variable-length array (C99).
@@ -94,7 +97,7 @@ int main(int argc, char *argv[])
     if(bind(listenfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0) MyDBG(end1);
     if(listen(listenfd, LISTENQ) < 0) MyDBG(end1);
 
-    // Main loop:
+    // Main dispatcher loop:
     while(1)
 
     {
@@ -103,21 +106,23 @@ int main(int argc, char *argv[])
         if((i = fcntl(clientfd, F_GETFL)) < 0) MyDBG(end2);
         i |= O_NONBLOCK; if(fcntl(clientfd, F_SETFL, i) < 0) MyDBG(end2);
 
-        // Complete the event structure:
+        // Return the fd to us later:
         ev.data.fd = clientfd;
-        continue;
+
+        // Round-robin epoll assignment:
+        if(j>c-1){j=0;}
+        if(epoll_ctl(core[j].epfd, EPOLL_CTL_ADD, clientfd, &ev) < 0) MyDBG(end2);
+        j++; continue;
 
         // Client error:
         end2: close(clientfd);
         continue;
     }
 
-    // Return on success (never):
-    pthread_exit(NULL);
-
     // Return on error:
     end1: close(listenfd);
-    end0: for(i=0; i<c; i++){close(core[i].epfd);} return -1;
+    end0: for(i=0; i<c; i++){close(core[i].epfd);}
+    return -1;
 }
 
 //-----------------------------------------------------------------------------
@@ -128,11 +133,34 @@ void *Worker(void *arg)
 
 {
     // Initializations:
+    int i, num;
+    struct epoll_event *ev;
     CORE_STRC *core = (PCORE_STRC) arg;
 
-    // Do something:
-    sleep(2);
+    // Allocate dynamic memory:
+    if((ev = malloc(sizeof(struct epoll_event) * MAX_EVENTS)) == NULL) MyDBG(end0);
 
-    // Return on success:
-    pthread_exit(NULL);
+    // Main worker loop:
+    while(1)
+
+    {
+        // Wait for events on the epoll set:
+        if((num = epoll_wait(core->epfd, ev, MAX_EVENTS, -1)) < 0) MyDBG(end1);
+
+        // For each fd ready:
+        for(i=0; i<num; i++)
+
+        {
+            // Data is ready in the kernel:
+            if(ev[i].events & EPOLLIN)
+            {printf("Thread: %u Descriptor: %d\n", (unsigned int)pthread_self(), ev[i].data.fd);}
+
+            // Not interested:
+            else {printf("Other event!\n");}
+        }
+    }
+
+    // Return on error:
+    end1: free(ev);
+    end0: pthread_exit(NULL);
 }
