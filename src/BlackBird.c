@@ -18,25 +18,6 @@
 #include <stdlib.h>
 
 //-----------------------------------------------------------------------------
-// Typedefs:
-//-----------------------------------------------------------------------------
-
-typedef struct _CORE_STRC
-
-{
-    int epfd;       // Epoll handler.
-    pthread_t tid;  // Thread ID.
-}
-
-CORE_STRC, *PCORE_STRC;
-
-//-----------------------------------------------------------------------------
-// Prototypes:
-//-----------------------------------------------------------------------------
-
-void *Worker(void *arg);
-
-//-----------------------------------------------------------------------------
 // Defines:
 //-----------------------------------------------------------------------------
 
@@ -46,6 +27,33 @@ void *Worker(void *arg);
 #define LISTENP 8080            // WebSockets port must be 80.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
 #define MAX_EVENTS 50           // Epoll max events.
+
+//-----------------------------------------------------------------------------
+// Typedefs:
+//-----------------------------------------------------------------------------
+
+typedef struct _CLIENT
+
+{
+    int clientfd;   // Socket file descriptor.
+}
+
+CLIENT, *PCLIENT;
+
+typedef struct _CORE
+
+{
+    pthread_t tid;  // Thread ID.
+    int epfd;       // Epoll handler.
+}
+
+CORE, *PCORE;
+
+//-----------------------------------------------------------------------------
+// Prototypes:
+//-----------------------------------------------------------------------------
+
+void *Worker(void *arg);
 
 //-----------------------------------------------------------------------------
 // Entry point:
@@ -59,13 +67,14 @@ int main(int argc, char *argv[])
     int c = sysconf(_SC_NPROCESSORS_ONLN);      // Number of cores.
     pthread_t thread = pthread_self();          // Main thread ID (myself).
     cpu_set_t cpuset;                           // Each bit represents a CPU.
-    CORE_STRC core[c];                          // Variable-length array (C99).
+    CORE core[c];                               // Variable-length array (C99).
     for(i=0; i<c; i++){core[i].epfd = -1;}      // Invalid file descriptors.
     int listenfd, clientfd;                     // Socket file descriptors.
     struct sockaddr_in servaddr, cliaddr;       // IPv4 socket address structure.
     socklen_t len = sizeof(cliaddr);            // Fixed length (16 bytes).
     struct epoll_event ev;                      // Describes epoll behavior as
     ev.events = EPOLLIN | EPOLLET;              // non-blocking edge-triggered.
+    PCLIENT cptr = NULL;                        // Pointer to client data.
 
     // For each core in the system:
     for(i=0; i<c; i++)
@@ -107,15 +116,20 @@ int main(int argc, char *argv[])
         if((i = fcntl(clientfd, F_GETFL)) < 0) MyDBG(end2);
         i |= O_NONBLOCK; if(fcntl(clientfd, F_SETFL, i) < 0) MyDBG(end2);
 
-        // Return the fd to us later:
-        ev.data.fd = clientfd;
+        // Initialize the client data structure:
+        if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end2);
+        cptr->clientfd = clientfd;
+
+        // Return to us later, in the worker thread:
+        ev.data.ptr = (void *)cptr;
 
         // Round-robin epoll assignment:
         if(j>c-1){j=0;}
-        if(epoll_ctl(core[j].epfd, EPOLL_CTL_ADD, clientfd, &ev) < 0) MyDBG(end2);
+        if(epoll_ctl(core[j].epfd, EPOLL_CTL_ADD, clientfd, &ev) < 0) MyDBG(end3);
         j++; continue;
 
         // Client error:
+        end3: free(cptr);
         end2: close(clientfd);
         continue;
     }
@@ -135,26 +149,23 @@ void *Worker(void *arg)
 {
     // Initializations:
     int i, num;
-    struct epoll_event *ev;
-    CORE_STRC *core = (PCORE_STRC) arg;
-
-    // Allocate dynamic memory:
-    if((ev = malloc(sizeof(struct epoll_event) * MAX_EVENTS)) == NULL) MyDBG(end0);
+    struct epoll_event ev [MAX_EVENTS];
+    PCORE core = (PCORE)arg;
 
     // Main worker loop:
     while(1)
 
     {
         // Wait for events on the epoll set:
-        if((num = epoll_wait(core->epfd, ev, MAX_EVENTS, -1)) < 0) MyDBG(end1);
+        if((num = epoll_wait(core->epfd, &ev[0], MAX_EVENTS, -1)) < 0) MyDBG(end0);
 
         // For each fd ready:
         for(i=0; i<num; i++)
 
         {
-            // Data is ready in the kernel:
+            // Data is ready in the kernel buffer:
             if(ev[i].events & EPOLLIN)
-            {printf("Thread: %u Ready: %d Descriptor: %d\n", (unsigned int)pthread_self(), num, ev[i].data.fd);}
+            {printf("Thread: %u Ready: %d Descriptor: %d\n", (unsigned int)pthread_self(), num, ((PCLIENT)(ev[i].data.ptr))->clientfd);}
 
             // Not interested:
             else {printf("Other event!\n");}
@@ -162,6 +173,5 @@ void *Worker(void *arg)
     }
 
     // Return on error:
-    end1: free(ev);
     end0: pthread_exit(NULL);
 }
