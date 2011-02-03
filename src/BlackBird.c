@@ -84,8 +84,9 @@ int main(int argc, char *argv[])
     CPU_ZERO(&cpuset); for(i=0; i<c; i++){CPU_SET(i, &cpuset);}
     if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end0);
 
-    // Blocking listen socket:
+    // Blocking socket, go ahead and reuse it:
     if((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end0);
+    i=1; if(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end1);
 
     // Initialize servaddr:
     bzero(&servaddr, sizeof(servaddr));
@@ -153,7 +154,7 @@ void *Worker(void *arg)
         {
             // Data is ready in the kernel:
             if(ev[i].events & EPOLLIN)
-            {printf("Thread: %u Descriptor: %d\n", (unsigned int)pthread_self(), ev[i].data.fd);}
+            {printf("Thread: %u Ready: %d Descriptor: %d\n", (unsigned int)pthread_self(), num, ev[i].data.fd);}
 
             // Not interested:
             else {printf("Other event!\n");}
