@@ -16,6 +16,7 @@
 #include <strings.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <errno.h>
 
 //-----------------------------------------------------------------------------
 // Defines:
@@ -27,6 +28,7 @@
 #define LISTENP 8080            // WebSockets port must be 80.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
 #define MAX_EVENTS 50           // Epoll max events.
+#define MTU_SIZE 1500           // Read up to MTU_SIZE bytes.
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -148,27 +150,53 @@ void *Worker(void *arg)
 
 {
     // Initializations:
-    int i, num;
+    int i, num, clientfd;
     struct epoll_event ev [MAX_EVENTS];
     PCORE core = (PCORE)arg;
+    char buf[MTU_SIZE];
+    ssize_t len;
 
     // Main worker loop:
     while(1)
 
     {
-        // Wait for events on the epoll set:
+        // Wait up to MAX_EVENTS events on the epoll-set:
         if((num = epoll_wait(core->epfd, &ev[0], MAX_EVENTS, -1)) < 0) MyDBG(end0);
 
-        // For each fd ready:
+        // For each event fired:
         for(i=0; i<num; i++)
 
         {
-            // Data is ready in the kernel buffer:
+            // The associated file kernel buffer is available for read:
             if(ev[i].events & EPOLLIN)
-            {printf("Thread: %u Ready: %d Descriptor: %d\n", (unsigned int)pthread_self(), num, ((PCLIENT)(ev[i].data.ptr))->clientfd);}
 
-            // Not interested:
-            else {printf("Other event!\n");}
+            {
+                // Get the socket fd and try to read some data (non-blocking):
+                if((clientfd = ((PCLIENT)(ev[i].data.ptr))->clientfd) < 1) MyDBG(end0);
+                read: len = read(clientfd, buf, MTU_SIZE);
+
+                // Data available:
+                if(len > 0)
+
+                {
+                    printf("T:%u R:%d F:%d D:%d\n", (unsigned int)pthread_self(), num, clientfd, (int)len);
+
+                    // Read again until it would block:
+                    goto read;
+                }
+
+                // EAGAIN = EWOULDBLOCK:
+                else if(len < 0 && errno == EAGAIN) continue;
+
+                // End of connection:
+                else if(len <= 0)
+
+                {
+                    if(epoll_ctl(core->epfd, EPOLL_CTL_DEL, clientfd, NULL) < 0) MyDBG(end0);
+                    free(ev[i].data.ptr);
+                    close(clientfd);
+                }
+            }
         }
     }
 
