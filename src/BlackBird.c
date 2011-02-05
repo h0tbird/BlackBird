@@ -37,7 +37,9 @@
 typedef struct _CLIENT
 
 {
-    int clientfd;   // Socket file descriptor.
+    int clifd;              // Socket file descriptor.
+    char buf[MTU_SIZE];     // Data buffer.
+    ssize_t len;            // Valid data lenght.
 }
 
 CLIENT, *PCLIENT;
@@ -71,8 +73,8 @@ int main(int argc, char *argv[])
     cpu_set_t cpuset;                           // Each bit represents a CPU.
     CORE core[c];                               // Variable-length array (C99).
     for(i=0; i<c; i++){core[i].epfd = -1;}      // Invalid file descriptors.
-    int listenfd, clientfd;                     // Socket file descriptors.
-    struct sockaddr_in servaddr, cliaddr;       // IPv4 socket address structure.
+    int srvfd, clifd;                           // Socket file descriptors.
+    struct sockaddr_in srvaddr, cliaddr;        // IPv4 socket address structure.
     socklen_t len = sizeof(cliaddr);            // Fixed length (16 bytes).
     struct epoll_event ev;                      // Describes epoll behavior as
     ev.events = EPOLLIN | EPOLLET;              // non-blocking edge-triggered.
@@ -96,48 +98,48 @@ int main(int argc, char *argv[])
     if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end0);
 
     // Blocking socket, go ahead and reuse it:
-    if((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end0);
-    i=1; if(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end1);
+    if((srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end0);
+    i=1; if(setsockopt(srvfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end1);
 
-    // Initialize servaddr:
-    bzero(&servaddr, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servaddr.sin_port = htons(LISTENP);
+    // Initialize srvaddr:
+    bzero(&srvaddr, sizeof(srvaddr));
+    srvaddr.sin_family = AF_INET;
+    srvaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    srvaddr.sin_port = htons(LISTENP);
 
     // Bind and listen:
-    if(bind(listenfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0) MyDBG(end1);
-    if(listen(listenfd, LISTENQ) < 0) MyDBG(end1);
+    if(bind(srvfd, (struct sockaddr *) &srvaddr, sizeof(srvaddr)) < 0) MyDBG(end1);
+    if(listen(srvfd, LISTENQ) < 0) MyDBG(end1);
 
     // Main dispatcher loop:
     while(1)
 
     {
         // Non-blocking client socket:
-        if((clientfd = accept(listenfd, (struct sockaddr *) &cliaddr, &len)) < 0) continue;
-        if((i = fcntl(clientfd, F_GETFL)) < 0) MyDBG(end2);
-        i |= O_NONBLOCK; if(fcntl(clientfd, F_SETFL, i) < 0) MyDBG(end2);
+        if((clifd = accept(srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) continue;
+        if((i = fcntl(clifd, F_GETFL)) < 0) MyDBG(end2);
+        i |= O_NONBLOCK; if(fcntl(clifd, F_SETFL, i) < 0) MyDBG(end2);
 
         // Initialize the client data structure:
         if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end2);
-        cptr->clientfd = clientfd;
+        cptr->clifd = clifd;
 
         // Return to us later, in the worker thread:
         ev.data.ptr = (void *)cptr;
 
         // Round-robin epoll assignment:
         if(j>c-1){j=0;}
-        if(epoll_ctl(core[j].epfd, EPOLL_CTL_ADD, clientfd, &ev) < 0) MyDBG(end3);
+        if(epoll_ctl(core[j].epfd, EPOLL_CTL_ADD, clifd, &ev) < 0) MyDBG(end3);
         j++; continue;
 
         // Client error:
         end3: free(cptr);
-        end2: close(clientfd);
+        end2: close(clifd);
         continue;
     }
 
     // Return on error:
-    end1: close(listenfd);
+    end1: close(srvfd);
     end0: for(i=0; i<c; i++){close(core[i].epfd);}
     return -1;
 }
@@ -150,10 +152,10 @@ void *Worker(void *arg)
 
 {
     // Initializations:
-    int i, num, clientfd;
+    int i, num;
     struct epoll_event ev [MAX_EVENTS];
     PCORE core = (PCORE)arg;
-    char buf[MTU_SIZE];
+    PCLIENT cptr;
     ssize_t len;
 
     // Main worker loop:
@@ -172,16 +174,17 @@ void *Worker(void *arg)
 
             {
                 // Get the socket fd and try to read some data (non-blocking):
-                if((clientfd = ((PCLIENT)(ev[i].data.ptr))->clientfd) < 1) MyDBG(end0);
-                read: len = read(clientfd, buf, MTU_SIZE);
+                (cptr = (PCLIENT)(ev[i].data.ptr))->len = 0;
+                read: len = read(cptr->clifd, &(cptr->buf[cptr->len]), MTU_SIZE);
 
                 // Data available:
                 if(len > 0)
 
                 {
-                    printf("T:%u R:%d F:%d D:%d\n", (unsigned int)pthread_self(), num, clientfd, (int)len);
+                    printf("T:%u R:%d F:%d D:%d\n", (unsigned int)pthread_self(), num, cptr->clifd, (int)len);
 
                     // Read again until it would block:
+                    cptr->len += len;
                     goto read;
                 }
 
@@ -192,9 +195,9 @@ void *Worker(void *arg)
                 else if(len <= 0)
 
                 {
-                    if(epoll_ctl(core->epfd, EPOLL_CTL_DEL, clientfd, NULL) < 0) MyDBG(end0);
-                    free(ev[i].data.ptr);
-                    close(clientfd);
+                    if(epoll_ctl(core->epfd, EPOLL_CTL_DEL, cptr->clifd, NULL) < 0) MyDBG(end0);
+                    close(cptr->clifd);
+                    free(cptr);
                 }
             }
         }
