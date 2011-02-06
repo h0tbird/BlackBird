@@ -24,11 +24,11 @@
 
 #define MyDBG(x) do {printf("Error: %s:%d\n", __FILE__, __LINE__); goto x;} while (0)
 
-#define DESCRIPTORS_HINT 100    // Just a hint to the kernel.
+#define DESCRIPTORS_HINT 250    // Just a hint to the kernel.
 #define LISTENP 8080            // WebSockets port must be 80.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
-#define MAX_EVENTS 50           // Epoll max events.
-#define MTU_SIZE 1500           // Read up to MTU_SIZE bytes.
+#define MAX_EVENTS 50           // Epoll max round events.
+#define MTU_SIZE 1400           // Read up to MTU_SIZE bytes.
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -77,7 +77,7 @@ int main(int argc, char *argv[])
     struct sockaddr_in srvaddr, cliaddr;        // IPv4 socket address structure.
     socklen_t len = sizeof(cliaddr);            // Fixed length (16 bytes).
     struct epoll_event ev;                      // Describes epoll behavior as
-    ev.events = EPOLLIN | EPOLLET;              // non-blocking edge-triggered.
+    ev.events = EPOLLIN;                        // non-blocking level-triggered.
     PCLIENT cptr = NULL;                        // Pointer to client data.
 
     // For each core in the system:
@@ -173,26 +173,19 @@ void *Worker(void *arg)
             if(ev[i].events & EPOLLIN)
 
             {
-                // Get the socket fd and try to read some data (non-blocking):
+                // Try to non-blocking read some data until it would block or MTU_SIZE:
                 (cptr = (PCLIENT)(ev[i].data.ptr))->len = 0;
-                read: len = read(cptr->clifd, &(cptr->buf[cptr->len]), MTU_SIZE);
+                read: len = read(cptr->clifd, &(cptr->buf[cptr->len]), MTU_SIZE-(cptr->len));
+                if(len>0){printf("[%d]:%d\n", cptr->clifd, (int)len); cptr->len+=len; goto read;}
 
-                // Data available:
-                if(len > 0)
+                // Ok, it would block or enough data readed for this round so jump to next fd:
+                else if((len<0 && errno==EAGAIN) || (len==0 && cptr->len==MTU_SIZE)) continue;
 
-                {
-                    printf("T:%u R:%d F:%d D:%d\n", (unsigned int)pthread_self(), num, cptr->clifd, (int)len);
-
-                    // Read again until it would block:
-                    cptr->len += len;
-                    goto read;
-                }
-
-                // EAGAIN = EWOULDBLOCK:
-                else if(len < 0 && errno == EAGAIN) continue;
+                // The call was interrupted by a signal before any data was read:
+                else if(len<0 && errno==EINTR) goto read;
 
                 // End of connection:
-                else if(len <= 0)
+                else if(len<=0)
 
                 {
                     if(epoll_ctl(core->epfd, EPOLL_CTL_DEL, cptr->clifd, NULL) < 0) MyDBG(end0);
