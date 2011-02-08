@@ -27,8 +27,9 @@
 #define DESCRIPTORS_HINT 250    // Just a hint to the kernel.
 #define LISTENP 8080            // WebSockets port must be 80.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
-#define MAX_EVENTS 50           // Epoll max round events.
-#define MTU_SIZE 1400           // Read up to MTU_SIZE bytes.
+#define MAX_EVENTS 50           // Epoll max events per round.
+#define MTU 1400                // Read up to MTU bytes per socket and round.
+#define MAX_BUF MTU*10          // Store up to 10 MTUs.
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -38,8 +39,9 @@ typedef struct _CLIENT
 
 {
     int clifd;              // Socket file descriptor.
-    char buf[MTU_SIZE];     // Data buffer.
-    ssize_t len;            // Valid data lenght.
+    char ibuf[MAX_BUF];     // Shared Input data buffer.
+    char obuf[MAX_BUF];     // Shared Output data buffer.
+    ssize_t ilen, olen;     // Valid data lenght.
 }
 
 CLIENT, *PCLIENT;
@@ -57,7 +59,8 @@ CORE, *PCORE;
 // Prototypes:
 //-----------------------------------------------------------------------------
 
-void *Worker(void *arg);
+void *IO_Worker(void *arg);
+int min(int x, int y);
 
 //-----------------------------------------------------------------------------
 // Entry point:
@@ -90,7 +93,7 @@ int main(int argc, char *argv[])
         // New threads inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
         if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end0);
-        if(pthread_create(&core[i].tid, NULL, Worker, (void *) &core[i]) != 0) MyDBG(end0);
+        if(pthread_create(&core[i].tid, NULL, IO_Worker, (void *) &core[i]) != 0) MyDBG(end0);
     }
 
     // Restore creator's affinity to all available cores:
@@ -122,7 +125,7 @@ int main(int argc, char *argv[])
 
         // Initialize the client data structure:
         if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end2);
-        cptr->clifd = clifd;
+        cptr->clifd = clifd; cptr->ilen = 0; cptr->olen = 0;
 
         // Return to us later, in the worker thread:
         ev.data.ptr = (void *)cptr;
@@ -145,10 +148,10 @@ int main(int argc, char *argv[])
 }
 
 //-----------------------------------------------------------------------------
-// Worker:
+// IO_Worker:
 //-----------------------------------------------------------------------------
 
-void *Worker(void *arg)
+void *IO_Worker(void *arg)
 
 {
     // Initializations:
@@ -156,7 +159,8 @@ void *Worker(void *arg)
     struct epoll_event ev [MAX_EVENTS];
     PCORE core = (PCORE)arg;
     PCLIENT cptr;
-    ssize_t len;
+    ssize_t n;
+    size_t len;
 
     // Main worker loop:
     while(1)
@@ -169,23 +173,31 @@ void *Worker(void *arg)
         for(i=0; i<num; i++)
 
         {
-            // The associated file kernel buffer is available for read:
+            // Get the pointer to the client data:
+            cptr = (PCLIENT)(ev[i].data.ptr);
+
+            // The file is available to be written to without blocking:
+            if(ev[i].events & EPOLLOUT) {printf("EPOLLOUT\n");}
+
+            // The file is available to be read from without blocking:
             if(ev[i].events & EPOLLIN)
 
             {
-                // Try to non-blocking read some data until it would block or MTU_SIZE:
-                (cptr = (PCLIENT)(ev[i].data.ptr))->len = 0;
-                read: len = read(cptr->clifd, &(cptr->buf[cptr->len]), MTU_SIZE-(cptr->len));
-                if(len>0){printf("[%d]:%d\n", cptr->clifd, (int)len); cptr->len+=len; goto read;}
+                // Initialize:
+                len = 0;
+
+                // Try to non-blocking read some data until it would block or MTU or MAX_BUF:
+                read: n = read(cptr->clifd, &(cptr->ibuf[cptr->ilen]), min(MTU-len, MAX_BUF-(cptr->ilen)));
+                if(n>0){len+=n; cptr->ilen+=n; printf("[%d]:%d:%d\n", cptr->clifd, cptr->ilen, (int)n); goto read;}
 
                 // Ok, it would block or enough data readed for this round so jump to next fd:
-                else if((len<0 && errno==EAGAIN) || (len==0 && cptr->len==MTU_SIZE)) continue;
+                else if((n<0 && errno==EAGAIN) || (n==0 && (len==MTU || cptr->ilen==MAX_BUF))) continue;
 
                 // The call was interrupted by a signal before any data was read:
-                else if(len<0 && errno==EINTR) goto read;
+                else if(n<0 && errno==EINTR) goto read;
 
                 // End of connection:
-                else if(len<=0)
+                else if(n<=0)
 
                 {
                     if(epoll_ctl(core->epfd, EPOLL_CTL_DEL, cptr->clifd, NULL) < 0) MyDBG(end0);
@@ -199,3 +211,9 @@ void *Worker(void *arg)
     // Return on error:
     end0: pthread_exit(NULL);
 }
+
+//-----------------------------------------------------------------------------
+// min: Function to find minimum of x and y
+//-----------------------------------------------------------------------------
+
+int min(int x, int y) {return y ^ ((x ^ y) & -(x < y));}
