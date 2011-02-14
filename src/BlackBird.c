@@ -66,7 +66,8 @@ CLIENT, *PCLIENT;
 typedef struct _CORE
 
 {
-    pthread_t tid;  // Thread ID.
+    pthread_t tio;  // IO Worker thread ID.
+    pthread_t tdp;  // DP Worker thread ID.
     int epfd;       // Epoll handler.
 }
 
@@ -77,6 +78,7 @@ CORE, *PCORE;
 //-----------------------------------------------------------------------------
 
 void *IO_Worker(void *arg);
+void *DP_Worker(void *arg);
 int min(int x, int y);
 
 //-----------------------------------------------------------------------------
@@ -110,7 +112,10 @@ int main(int argc, char *argv[])
         // New threads inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
         if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end0);
-        if(pthread_create(&core[i].tid, NULL, IO_Worker, (void *) &core[i]) != 0) MyDBG(end0);
+
+        // Create the IO_Worker and the DP_Worker:
+        if(pthread_create(&core[i].tio, NULL, IO_Worker, (void *) &core[i]) != 0) MyDBG(end0);
+        if(pthread_create(&core[i].tdp, NULL, DP_Worker, (void *) &core[i]) != 0) MyDBG(end0);
     }
 
     // Restore creator's affinity to all available cores:
@@ -193,9 +198,6 @@ void *IO_Worker(void *arg)
             // Get the pointer to the client data:
             cptr = (PCLIENT)(ev[i].data.ptr);
 
-            // The file is available to be written to without blocking:
-            if(ev[i].events & EPOLLOUT) {printf("EPOLLOUT\n");}
-
             // The file is available to be read from without blocking:
             if(ev[i].events & EPOLLIN)
 
@@ -227,6 +229,24 @@ void *IO_Worker(void *arg)
 
     // Return on error:
     end0: pthread_exit(NULL);
+}
+
+//-----------------------------------------------------------------------------
+// DP_Worker:
+//-----------------------------------------------------------------------------
+
+void *DP_Worker(void *arg)
+
+{
+    // Initializations:
+    // PCORE core = (PCORE)arg;
+
+    // Main worker loop:
+    while(1)
+
+    {
+        sleep(2);
+    }
 }
 
 //-----------------------------------------------------------------------------
