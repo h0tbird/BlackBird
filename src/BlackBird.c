@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #include <unistd.h>
 #include <stdio.h>
+#include <getopt.h>
 #include <sys/epoll.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -45,8 +46,6 @@
 #define LISTENP 8080            // WebSockets port must be 80.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
 #define MAX_EVENTS 50           // Epoll max events per round.
-#define MTU 1400                // Read up to MTU bytes per socket and round.
-#define MAX_BUF MTU*10          // Store up to 10 MTUs.
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -55,10 +54,7 @@
 typedef struct _CLIENT
 
 {
-    int clifd;              // Socket file descriptor.
-    char ibuf[MAX_BUF];     // Shared Input data buffer.
-    char obuf[MAX_BUF];     // Shared Output data buffer.
-    ssize_t ilen, olen;     // Valid data lenght.
+    int clifd;    // Client socket file descriptor.
 }
 
 CLIENT, *PCLIENT;
@@ -66,20 +62,36 @@ CLIENT, *PCLIENT;
 typedef struct _CORE
 
 {
-    pthread_t tio;  // IO Worker thread ID.
-    pthread_t tdp;  // DP Worker thread ID.
-    int epfd;       // Epoll handler.
+    pthread_t t_acc;    // Accept worker thread ID.
+    pthread_t t_wai;    // Wait worker thread ID.
+    int epfd;           // Epoll handler.
 }
 
 CORE, *PCORE;
+
+typedef struct _SERVER
+
+{
+    int srvfd;     // Server socket file descriptor.
+    int cores;     // Number of system cores.
+    PCORE core;    // Will point to an array of cores.
+}
+
+SERVER, *PSERVER;
 
 //-----------------------------------------------------------------------------
 // Prototypes:
 //-----------------------------------------------------------------------------
 
-void *IO_Worker(void *arg);
-void *DP_Worker(void *arg);
-int min(int x, int y);
+void *W_Acce(void *arg);    // Acce Worker.
+void *W_Wait(void *arg);    // Wait Worker.
+void *W_Data(void *arg);    // Data Worker.
+
+//-----------------------------------------------------------------------------
+// Globals:
+//-----------------------------------------------------------------------------
+
+SERVER s;    // Main server structure.
 
 //-----------------------------------------------------------------------------
 // Entry point:
@@ -89,42 +101,38 @@ int main(int argc, char *argv[])
 
 {
     // Initializations:
-    int i, j=0;                                 // For general use.
-    int c = sysconf(_SC_NPROCESSORS_ONLN);      // Number of cores.
-    pthread_t thread = pthread_self();          // Main thread ID (myself).
-    cpu_set_t cpuset;                           // Each bit represents a CPU.
-    CORE core[c];                               // Variable-length array (C99).
-    for(i=0; i<c; i++){core[i].epfd = -1;}      // Invalid file descriptors.
-    int srvfd, clifd;                           // Socket file descriptors.
-    struct sockaddr_in srvaddr, cliaddr;        // IPv4 socket address structure.
-    socklen_t len = sizeof(cliaddr);            // Fixed length (16 bytes).
-    struct epoll_event ev;                      // Describes epoll behavior as
-    ev.events = EPOLLIN;                        // non-blocking level-triggered.
-    PCLIENT cptr = NULL;                        // Pointer to client data.
+    int i, c, do_help;                    // For general use.
+    pthread_t thread = pthread_self();    // Main thread ID (myself).
+    cpu_set_t cpuset;                     // Each bit represents a CPU.
+    pthread_attr_t attr;                  // Pthread attribute variable.
+    struct sockaddr_in srvaddr;           // IPv4 socket address structure.
 
-    // For each core in the system:
-    for(i=0; i<c; i++)
+    // Parse command line options:
+    struct option longopts[] = {
+    { "max-clients",  optional_argument,  NULL,        'c' },
+    { "max-active",   optional_argument,  NULL,        'a' },
+    { "help",         no_argument,        & do_help,     1 },
+    { 0, 0, 0, 0 }};
+
+    while((c = getopt_long(argc, argv, "c::a::", longopts, NULL)) != -1)
 
     {
-        // Open an epoll fd dimensioned for DESCRIPTORS_HINT descriptors:
-        if((core[i].epfd = epoll_create(DESCRIPTORS_HINT)) < 0) MyDBG(end0);
+        switch(c)
 
-        // New threads inherits a copy of its creator's CPU affinity mask:
-        CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
-        if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end0);
-
-        // Create the IO_Worker and the DP_Worker:
-        if(pthread_create(&core[i].tio, NULL, IO_Worker, (void *) &core[i]) != 0) MyDBG(end0);
-        if(pthread_create(&core[i].tdp, NULL, DP_Worker, (void *) &core[i]) != 0) MyDBG(end0);
+        {
+            case 'c': break;
+            case 'a': break;
+        }
     }
 
-    // Restore creator's affinity to all available cores:
-    CPU_ZERO(&cpuset); for(i=0; i<c; i++){CPU_SET(i, &cpuset);}
-    if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end0);
+    // Initialize server and core structures:
+    s.cores = sysconf(_SC_NPROCESSORS_ONLN); s.srvfd = -1;
+    if((s.core = malloc(sizeof(CORE) * s.cores)) == NULL) MyDBG(end0);
+    for(i=0; i<s.cores; i++){s.core[i].epfd = -1;}
 
-    // Blocking socket, go ahead and reuse it:
-    if((srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end0);
-    i=1; if(setsockopt(srvfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end1);
+    // Server blocking socket. Go ahead and reuse it:
+    if((s.srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end1);
+    i=1; if(setsockopt(s.srvfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end2);
 
     // Initialize srvaddr:
     bzero(&srvaddr, sizeof(srvaddr));
@@ -133,96 +141,136 @@ int main(int argc, char *argv[])
     srvaddr.sin_port = htons(LISTENP);
 
     // Bind and listen:
-    if(bind(srvfd, (struct sockaddr *) &srvaddr, sizeof(srvaddr)) < 0) MyDBG(end1);
-    if(listen(srvfd, LISTENQ) < 0) MyDBG(end1);
+    if(bind(s.srvfd, (struct sockaddr *) &srvaddr, sizeof(srvaddr)) < 0) MyDBG(end2);
+    if(listen(s.srvfd, LISTENQ) < 0) MyDBG(end2);
 
-    // Main dispatcher loop:
-    while(1)
+    // Threads are explicitly created in a joinable state:
+    if(pthread_attr_init(&attr) != 0) MyDBG(end2);
+    if(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE) != 0) MyDBG(end3);
+
+    // For each core in the system:
+    for(i=0; i<s.cores; i++)
 
     {
-        // Non-blocking client socket:
-        if((clifd = accept(srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) continue;
-        if((i = fcntl(clifd, F_GETFL)) < 0) MyDBG(end2);
-        i |= O_NONBLOCK; if(fcntl(clifd, F_SETFL, i) < 0) MyDBG(end2);
+        // Open an epoll fd dimensioned for DESCRIPTORS_HINT descriptors:
+        if((s.core[i].epfd = epoll_create(DESCRIPTORS_HINT)) < 0) MyDBG(end4);
 
-        // Initialize the client data structure:
-        if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end2);
-        cptr->clifd = clifd; cptr->ilen = 0; cptr->olen = 0;
+        // New threads inherits a copy of its creator's CPU affinity mask:
+        CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
+        if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end4);
 
-        // Return to us later, in the worker thread:
-        ev.data.ptr = (void *)cptr;
-
-        // Round-robin epoll assignment:
-        if(j>c-1){j=0;}
-        if(epoll_ctl(core[j].epfd, EPOLL_CTL_ADD, clifd, &ev) < 0) MyDBG(end3);
-        j++; continue;
-
-        // Client error:
-        end3: free(cptr);
-        end2: close(clifd);
-        continue;
+        // Create the Acce Worker and the Wait Worker:
+        if(pthread_create(&s.core[i].t_acc, &attr, W_Acce, (void *) &s.core[i]) != 0) MyDBG(end4);
+        if(pthread_create(&s.core[i].t_wai, &attr, W_Wait, (void *) &s.core[i]) != 0) MyDBG(end4);
     }
 
+    // Restore creator's (myself) affinity to all available cores:
+    CPU_ZERO(&cpuset); for(i=0; i<s.cores; i++){CPU_SET(i, &cpuset);}
+    if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end4);
+
+    // Pre-threading a pool of Data Workers:
+
+    // Free library resources used by the attribute:
+    pthread_attr_destroy(&attr);
+
+    // Explicitly join all worker threads:
+    for(i=0; i<s.cores; i++)
+
+    {
+        if(pthread_join(s.core[i].t_acc, NULL) != 0) MyDBG(end4);
+        if(pthread_join(s.core[i].t_wai, NULL) != 0) MyDBG(end4);
+    }
+
+    // Return on succes:
+    pthread_exit(NULL);
+
     // Return on error:
-    end1: close(srvfd);
-    end0: for(i=0; i<c; i++){close(core[i].epfd);}
-    return -1;
+    end4: for(i=0; i<s.cores; i++){close(s.core[i].epfd);}
+    end3: pthread_attr_destroy(&attr);
+    end2: close(s.srvfd);
+    end1: free(s.core);
+    end0: return -1;
 }
 
 //-----------------------------------------------------------------------------
-// IO_Worker:
+// W_Acce:
 //-----------------------------------------------------------------------------
 
-void *IO_Worker(void *arg)
+void *W_Acce(void *arg)
 
 {
     // Initializations:
-    int i, num;
-    struct epoll_event ev [MAX_EVENTS];
-    PCORE core = (PCORE)arg;
-    PCLIENT cptr;
-    ssize_t n;
-    size_t len;
+    int i, clifd;                       // Socket file descriptor.
+    struct sockaddr_in cliaddr;         // IPv4 socket address structure.
+    socklen_t len = sizeof(cliaddr);    // Fixed length (16 bytes).
+    PCORE core = (PCORE)arg;            // Pointer to core data.
+    PCLIENT cptr = NULL;                // Pointer to client data.
+    struct epoll_event ev;              // Epoll event structure.
 
-    // Main worker loop:
+    // Setup epoll behavior as one-shot-edge-triggered:
+    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+
+    // Main thread loop:
     while(1)
 
     {
-        // Wait up to MAX_EVENTS events on the epoll-set:
-        if((num = epoll_wait(core->epfd, &ev[0], MAX_EVENTS, -1)) < 0) MyDBG(end0);
+        // Blocking accept returns a non-blocking client socket:
+        if((clifd = accept(s.srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) MyDBG(end0);
+        if((i = fcntl(clifd, F_GETFL)) < 0) MyDBG(end1);
+        i |= O_NONBLOCK; if(fcntl(clifd, F_SETFL, i) < 0) MyDBG(end1);
 
-        // For each event fired:
-        for(i=0; i<num; i++)
+        // Initialize the client data structure:
+        if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end1);
+        cptr->clifd = clifd;
+
+        // Return data to us later:
+        ev.data.ptr = (void *)cptr;
+
+        // Epoll assignment:
+        if(epoll_ctl(core->epfd, EPOLL_CTL_ADD, clifd, &ev) < 0) MyDBG(end2);
+        continue;
+
+        // Client error:
+        end2: free(cptr);
+        end1: close(clifd);
+    }
+
+    // Return on error:
+    end0: pthread_exit(NULL);
+}
+
+//-----------------------------------------------------------------------------
+// W_Wait:
+//-----------------------------------------------------------------------------
+
+void *W_Wait(void *arg)
+
+{
+    // Initializations:
+    int i, n;
+    PCORE core = (PCORE)arg;             // Pointer to core data.
+    PCLIENT cptr = NULL;                 // Pointer to client data.
+    struct epoll_event ev [MAX_EVENTS];  // Epoll-events array.
+
+    // Main thread loop:
+    while(1)
+
+    {
+        // Wait up to MAX_EVENTS on the epoll-set:
+        if((n = epoll_wait(core->epfd, &ev[0], MAX_EVENTS, -1)) < 0) MyDBG(end0);
+
+        // For each event fired: if the fd is available to be read from
+        // without blocking, it is transfered to the Data Workers pool:
+        for(i=0; i<n; i++)
 
         {
             // Get the pointer to the client data:
             cptr = (PCLIENT)(ev[i].data.ptr);
 
-            // The file is available to be read from without blocking:
             if(ev[i].events & EPOLLIN)
 
             {
-                // Initialize:
-                len = 0;
-
-                // Try to non-blocking read some data until it would block or MTU or MAX_BUF:
-                read: n = read(cptr->clifd, &(cptr->ibuf[cptr->ilen]), min(MTU-len, MAX_BUF-(cptr->ilen)));
-                if(n>0){len+=n; cptr->ilen+=n; printf("[%d]:%d:%d\n", cptr->clifd, cptr->ilen, (int)n); goto read;}
-
-                // Ok, it would block or enough data readed for this round so jump to next fd:
-                else if((n<0 && errno==EAGAIN) || (n==0 && (len==MTU || cptr->ilen==MAX_BUF))) continue;
-
-                // The call was interrupted by a signal before any data was read:
-                else if(n<0 && errno==EINTR) goto read;
-
-                // End of connection:
-                else if(n<=0)
-
-                {
-                    if(epoll_ctl(core->epfd, EPOLL_CTL_DEL, cptr->clifd, NULL) < 0) MyDBG(end0);
-                    close(cptr->clifd);
-                    free(cptr);
-                }
+                printf("[%d]\n", cptr->clifd);
             }
         }
     }
@@ -232,25 +280,12 @@ void *IO_Worker(void *arg)
 }
 
 //-----------------------------------------------------------------------------
-// DP_Worker:
+// W_Data:
 //-----------------------------------------------------------------------------
 
-void *DP_Worker(void *arg)
+void *W_Data(void *arg)
 
 {
-    // Initializations:
-    // PCORE core = (PCORE)arg;
-
-    // Main worker loop:
-    while(1)
-
-    {
-        sleep(2);
-    }
+    // Return on error:
+    pthread_exit(NULL);
 }
-
-//-----------------------------------------------------------------------------
-// min: Function to find minimum of x and y
-//-----------------------------------------------------------------------------
-
-int min(int x, int y) {return y ^ ((x ^ y) & -(x < y));}
