@@ -40,12 +40,13 @@
 // Defines:
 //-----------------------------------------------------------------------------
 
-#define MyDBG(x) do {printf("Error: %s:%d\n", __FILE__, __LINE__); goto x;} while (0)
+#define MyDBG(x) do {printf("(%d) %s:%d\n", errno, __FILE__, __LINE__); goto x;} while (0)
 
-#define DESCRIPTORS_HINT 250    // Just a hint to the kernel.
+#define MAX_CLIENTS 500         // Defaults for maxc.
+#define MAX_ACTIVE 100          // Defaults for maxa.
+#define MAX_EVENTS 50           // Defaults for maxe.
 #define LISTENP 8080            // WebSockets port must be 80.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
-#define MAX_EVENTS 50           // Epoll max events per round.
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -58,6 +59,16 @@ typedef struct _CLIENT
 }
 
 CLIENT, *PCLIENT;
+
+typedef struct _CONF
+
+{
+    int maxc;    // Epoll size hint.
+    int maxa;    // Pre-threading hint.
+    int maxe;    // Epoll events per round.
+}
+
+CONF, *PCONF;
 
 typedef struct _CORE
 
@@ -75,6 +86,7 @@ typedef struct _SERVER
     int srvfd;     // Server socket file descriptor.
     int cores;     // Number of system cores.
     PCORE core;    // Will point to an array of cores.
+    CONF cnf;      // Will store configuration options.
 }
 
 SERVER, *PSERVER;
@@ -101,34 +113,46 @@ int main(int argc, char *argv[])
 
 {
     // Initializations:
-    int i, c, do_help;                    // For general use.
+    int i;                                // For general use.
     pthread_t thread = pthread_self();    // Main thread ID (myself).
     cpu_set_t cpuset;                     // Each bit represents a CPU.
     pthread_attr_t attr;                  // Pthread attribute variable.
     struct sockaddr_in srvaddr;           // IPv4 socket address structure.
 
-    // Parse command line options:
-    struct option longopts[] = {
-    { "max-clients",  optional_argument,  NULL,        'c' },
-    { "max-active",   optional_argument,  NULL,        'a' },
-    { "help",         no_argument,        & do_help,     1 },
-    { 0, 0, 0, 0 }};
-
-    while((c = getopt_long(argc, argv, "c::a::", longopts, NULL)) != -1)
-
-    {
-        switch(c)
-
-        {
-            case 'c': break;
-            case 'a': break;
-        }
-    }
-
     // Initialize server and core structures:
     s.cores = sysconf(_SC_NPROCESSORS_ONLN); s.srvfd = -1;
     if((s.core = malloc(sizeof(CORE) * s.cores)) == NULL) MyDBG(end0);
     for(i=0; i<s.cores; i++){s.core[i].epfd = -1;}
+
+    // Set config defaults:
+    s.cnf.maxc = MAX_CLIENTS;
+    s.cnf.maxa = MAX_ACTIVE;
+    s.cnf.maxe = MAX_EVENTS;
+
+    // Parse command line options:
+    struct option longopts[] = {
+    { "max-clients",  required_argument,  NULL,  'c' },
+    { "max-active",   required_argument,  NULL,  'a' },
+    { "max-events",   required_argument,  NULL,  'e' },
+    { 0, 0, 0, 0 }};
+
+    while((i = getopt_long(argc, argv, "c:a:e:", longopts, NULL)) != -1)
+
+    {
+        if (i == -1) break;
+
+        switch(i)
+
+        {
+            case 'c': s.cnf.maxc = atoi(optarg);
+                      break;
+            case 'a': s.cnf.maxa = atoi(optarg);
+                      break;
+            case 'e': s.cnf.maxe = atoi(optarg);
+                      break;
+            default:  abort();
+        }
+    }
 
     // Server blocking socket. Go ahead and reuse it:
     if((s.srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end1);
@@ -152,8 +176,8 @@ int main(int argc, char *argv[])
     for(i=0; i<s.cores; i++)
 
     {
-        // Open an epoll fd dimensioned for DESCRIPTORS_HINT descriptors:
-        if((s.core[i].epfd = epoll_create(DESCRIPTORS_HINT)) < 0) MyDBG(end4);
+        // Open an epoll fd dimensioned for s.cnf.maxc/s.cores descriptors:
+        if((s.core[i].epfd = epoll_create(s.cnf.maxc/s.cores)) < 0) MyDBG(end4);
 
         // New threads inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
@@ -168,12 +192,13 @@ int main(int argc, char *argv[])
     CPU_ZERO(&cpuset); for(i=0; i<s.cores; i++){CPU_SET(i, &cpuset);}
     if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end4);
 
-    // Pre-threading a pool of Data Workers:
+    // Pre-threading a pool of s.cnf.maxa Data Workers:
+    for(i=0; i<s.cnf.maxa; i++){if(pthread_create(&thread, &attr, W_Data, NULL) != 0) MyDBG(end4);}
 
     // Free library resources used by the attribute:
     pthread_attr_destroy(&attr);
 
-    // Explicitly join all worker threads:
+    // Explicitly join worker threads:
     for(i=0; i<s.cores; i++)
 
     {
@@ -250,14 +275,14 @@ void *W_Wait(void *arg)
     int i, n;
     PCORE core = (PCORE)arg;             // Pointer to core data.
     PCLIENT cptr = NULL;                 // Pointer to client data.
-    struct epoll_event ev [MAX_EVENTS];  // Epoll-events array.
+    struct epoll_event ev[s.cnf.maxe];   // Epoll-events array (C99).
 
     // Main thread loop:
     while(1)
 
     {
-        // Wait up to MAX_EVENTS on the epoll-set:
-        if((n = epoll_wait(core->epfd, &ev[0], MAX_EVENTS, -1)) < 0) MyDBG(end0);
+        // Wait up to s.cnf.maxe on the epoll-set:
+        if((n = epoll_wait(core->epfd, &ev[0], s.cnf.maxe, -1)) < 0) MyDBG(end0);
 
         // For each event fired: if the fd is available to be read from
         // without blocking, it is transfered to the Data Workers pool:
