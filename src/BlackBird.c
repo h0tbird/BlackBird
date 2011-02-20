@@ -56,6 +56,7 @@ typedef struct _CLIENT
 
 {
     int clifd;    // Client socket file descriptor.
+    int epfd;     // Epoll monitoring clifd.
 }
 
 CLIENT, *PCLIENT;
@@ -83,10 +84,12 @@ CORE, *PCORE;
 typedef struct _SERVER
 
 {
-    int srvfd;     // Server socket file descriptor.
-    int cores;     // Number of system cores.
-    PCORE core;    // Will point to an array of cores.
-    CONF cnf;      // Will store configuration options.
+    int srvfd;         // Server socket file descriptor.
+    int cores;         // Number of system cores.
+    PCORE core;        // Will point to an array of cores.
+    CONF cnf;          // Will store configuration options.
+    PCLIENT *cli;      // Will store an array of client pointers.
+    int iput, iget;    // Indexes for the cli array.
 }
 
 SERVER, *PSERVER;
@@ -103,7 +106,9 @@ void *W_Data(void *arg);    // Data Worker.
 // Globals:
 //-----------------------------------------------------------------------------
 
-SERVER s;    // Main server structure.
+SERVER s;
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cnd = PTHREAD_COND_INITIALIZER;
 
 //-----------------------------------------------------------------------------
 // Entry point:
@@ -118,11 +123,6 @@ int main(int argc, char *argv[])
     cpu_set_t cpuset;                     // Each bit represents a CPU.
     pthread_attr_t attr;                  // Pthread attribute variable.
     struct sockaddr_in srvaddr;           // IPv4 socket address structure.
-
-    // Initialize server and core structures:
-    s.cores = sysconf(_SC_NPROCESSORS_ONLN); s.srvfd = -1;
-    if((s.core = malloc(sizeof(CORE) * s.cores)) == NULL) MyDBG(end0);
-    for(i=0; i<s.cores; i++){s.core[i].epfd = -1;}
 
     // Set config defaults:
     s.cnf.maxc = MAX_CLIENTS;
@@ -154,9 +154,21 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Initialize server structures:
+    s.cores = sysconf(_SC_NPROCESSORS_ONLN);
+    s.srvfd = -1; s.iput = s.iget = 0;
+
+    // Malloc an array of cores:
+    if((s.core = malloc(sizeof(CORE) * s.cores)) == NULL) MyDBG(end0);
+    for(i=0; i<s.cores; i++){s.core[i].epfd = -1;}
+
+    // Malloc an array of client pointers:
+    if((s.cli = malloc(sizeof(PCLIENT) * s.cnf.maxc)) == NULL) MyDBG(end1);
+    for(i=0; i<s.cnf.maxc; i++){s.cli[i] = NULL;}
+
     // Server blocking socket. Go ahead and reuse it:
-    if((s.srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end1);
-    i=1; if(setsockopt(s.srvfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end2);
+    if((s.srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end2);
+    i=1; if(setsockopt(s.srvfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end3);
 
     // Initialize srvaddr:
     bzero(&srvaddr, sizeof(srvaddr));
@@ -165,35 +177,35 @@ int main(int argc, char *argv[])
     srvaddr.sin_port = htons(LISTENP);
 
     // Bind and listen:
-    if(bind(s.srvfd, (struct sockaddr *) &srvaddr, sizeof(srvaddr)) < 0) MyDBG(end2);
-    if(listen(s.srvfd, LISTENQ) < 0) MyDBG(end2);
+    if(bind(s.srvfd, (struct sockaddr *) &srvaddr, sizeof(srvaddr)) < 0) MyDBG(end3);
+    if(listen(s.srvfd, LISTENQ) < 0) MyDBG(end3);
 
     // Threads are explicitly created in a joinable state:
-    if(pthread_attr_init(&attr) != 0) MyDBG(end2);
-    if(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE) != 0) MyDBG(end3);
+    if(pthread_attr_init(&attr) != 0) MyDBG(end3);
+    if(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE) != 0) MyDBG(end4);
 
     // For each core in the system:
     for(i=0; i<s.cores; i++)
 
     {
         // Open an epoll fd dimensioned for s.cnf.maxc/s.cores descriptors:
-        if((s.core[i].epfd = epoll_create(s.cnf.maxc/s.cores)) < 0) MyDBG(end4);
+        if((s.core[i].epfd = epoll_create(s.cnf.maxc/s.cores)) < 0) MyDBG(end5);
 
         // New threads inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
-        if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end4);
+        if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end5);
 
         // Create the Acce Worker and the Wait Worker:
-        if(pthread_create(&s.core[i].t_acc, &attr, W_Acce, (void *) &s.core[i]) != 0) MyDBG(end4);
-        if(pthread_create(&s.core[i].t_wai, &attr, W_Wait, (void *) &s.core[i]) != 0) MyDBG(end4);
+        if(pthread_create(&s.core[i].t_acc, &attr, W_Acce, (void *) &s.core[i]) != 0) MyDBG(end5);
+        if(pthread_create(&s.core[i].t_wai, &attr, W_Wait, (void *) &s.core[i]) != 0) MyDBG(end5);
     }
 
     // Restore creator's (myself) affinity to all available cores:
     CPU_ZERO(&cpuset); for(i=0; i<s.cores; i++){CPU_SET(i, &cpuset);}
-    if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end4);
+    if(pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end5);
 
     // Pre-threading a pool of s.cnf.maxa Data Workers:
-    for(i=0; i<s.cnf.maxa; i++){if(pthread_create(&thread, &attr, W_Data, NULL) != 0) MyDBG(end4);}
+    for(i=0; i<s.cnf.maxa; i++){if(pthread_create(&thread, &attr, W_Data, NULL) != 0) MyDBG(end5);}
 
     // Free library resources used by the attribute:
     pthread_attr_destroy(&attr);
@@ -202,17 +214,18 @@ int main(int argc, char *argv[])
     for(i=0; i<s.cores; i++)
 
     {
-        if(pthread_join(s.core[i].t_acc, NULL) != 0) MyDBG(end4);
-        if(pthread_join(s.core[i].t_wai, NULL) != 0) MyDBG(end4);
+        if(pthread_join(s.core[i].t_acc, NULL) != 0) MyDBG(end5);
+        if(pthread_join(s.core[i].t_wai, NULL) != 0) MyDBG(end5);
     }
 
     // Return on succes:
     pthread_exit(NULL);
 
     // Return on error:
-    end4: for(i=0; i<s.cores; i++){close(s.core[i].epfd);}
-    end3: pthread_attr_destroy(&attr);
-    end2: close(s.srvfd);
+    end5: for(i=0; i<s.cores; i++){close(s.core[i].epfd);}
+    end4: pthread_attr_destroy(&attr);
+    end3: close(s.srvfd);
+    end2: free(s.cli);
     end1: free(s.core);
     end0: return -1;
 }
@@ -246,6 +259,7 @@ void *W_Acce(void *arg)
 
         // Initialize the client data structure:
         if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end1);
+        cptr->epfd = core->epfd;
         cptr->clifd = clifd;
 
         // Return data to us later:
@@ -274,7 +288,6 @@ void *W_Wait(void *arg)
     // Initializations:
     int i, n;
     PCORE core = (PCORE)arg;             // Pointer to core data.
-    PCLIENT cptr = NULL;                 // Pointer to client data.
     struct epoll_event ev[s.cnf.maxe];   // Epoll-events array (C99).
 
     // Main thread loop:
@@ -289,13 +302,23 @@ void *W_Wait(void *arg)
         for(i=0; i<n; i++)
 
         {
-            // Get the pointer to the client data:
-            cptr = (PCLIENT)(ev[i].data.ptr);
-
             if(ev[i].events & EPOLLIN)
 
             {
-                printf("[%d]\n", cptr->clifd);
+                // Enter the critical section:
+                if(pthread_mutex_lock(&mtx) != 0) MyDBG(end0);
+
+                // Get the pointer to the client data:
+                s.cli[s.iput] = (PCLIENT)(ev[i].data.ptr);
+                printf("[%d]\n", s.cli[s.iput]->clifd);
+                if(++s.iput == s.cnf.maxc){s.iput=0;}
+                if(s.iput == s.iget) MyDBG(end0);
+
+                // Signal to awake sleeping thread:
+                if(pthread_cond_signal(&cnd) != 0) MyDBG(end0);
+
+                // Leave the critical section:
+                if(pthread_mutex_unlock(&mtx) != 0) MyDBG(end0);
             }
         }
     }
@@ -311,6 +334,24 @@ void *W_Wait(void *arg)
 void *W_Data(void *arg)
 
 {
+    // Initializations:
+    PCLIENT cptr = NULL;
+
+    // Main thread loop:
+    while(1)
+
+    {
+        // Critical section:
+        if(pthread_mutex_lock(&mtx) != 0) MyDBG(end0);
+        while(s.iget == s.iput){if(pthread_cond_wait(&cnd, &mtx) != 0) MyDBG(end0);}
+        cptr = s.cli[s.iget]; if(++s.iget == s.cnf.maxc){s.iget=0;}
+        if(pthread_mutex_unlock(&mtx) != 0) MyDBG(end0);
+
+        // Drain the socket:
+
+        // Trigger re-arm:
+    }
+
     // Return on error:
-    pthread_exit(NULL);
+    end0: pthread_exit(NULL);
 }
