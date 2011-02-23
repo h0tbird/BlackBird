@@ -43,10 +43,11 @@
 #define MyDBG(x) do {printf("(%d) %s:%d\n", errno, __FILE__, __LINE__); goto x;} while (0)
 
 #define MAX_CLIENTS 500         // Defaults for maxc.
-#define MAX_ACTIVE 100          // Defaults for maxa.
+#define MAX_THREADS 50          // Defaults for maxt.
 #define MAX_EVENTS 50           // Defaults for maxe.
-#define LISTENP 8080            // WebSockets port must be 80.
+#define LISTENP 8080            // Server listen port.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
+#define MTU 2896                // 2*(1500-40-12) per socket and round.
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -56,7 +57,7 @@ typedef struct _CLIENT
 
 {
     int clifd;    // Client socket file descriptor.
-    int epfd;     // Epoll monitoring clifd.
+    int epfd;     // Epoll monitoring this clifd.
 }
 
 CLIENT, *PCLIENT;
@@ -65,7 +66,7 @@ typedef struct _CONF
 
 {
     int maxc;    // Epoll size hint.
-    int maxa;    // Pre-threading hint.
+    int maxt;    // Pre-threading hint.
     int maxe;    // Epoll events per round.
 }
 
@@ -92,6 +93,8 @@ void *W_Acce(void *arg);    // Acce Worker.
 void *W_Wait(void *arg);    // Wait Worker.
 void *W_Data(void *arg);    // Data Worker.
 
+int parser(char *buff, int len, PCLIENT cptr);
+
 //-----------------------------------------------------------------------------
 // Globals:
 //-----------------------------------------------------------------------------
@@ -115,13 +118,13 @@ int main(int argc, char *argv[])
 
     // Set config defaults:
     s.cnf.maxc = MAX_CLIENTS;
-    s.cnf.maxa = MAX_ACTIVE;
+    s.cnf.maxt = MAX_THREADS;
     s.cnf.maxe = MAX_EVENTS;
 
     // Parse command line options:
     struct option longopts[] = {
     { "max-clients",  required_argument,  NULL,  'c' },
-    { "max-active",   required_argument,  NULL,  'a' },
+    { "max-threads",  required_argument,  NULL,  't' },
     { "max-events",   required_argument,  NULL,  'e' },
     { 0, 0, 0, 0 }};
 
@@ -135,7 +138,7 @@ int main(int argc, char *argv[])
         {
             case 'c': s.cnf.maxc = atoi(optarg);
                       break;
-            case 'a': s.cnf.maxa = atoi(optarg);
+            case 't': s.cnf.maxt = atoi(optarg);
                       break;
             case 'e': s.cnf.maxe = atoi(optarg);
                       break;
@@ -185,8 +188,8 @@ int main(int argc, char *argv[])
     CPU_ZERO(&cpuset); for(i=0; i<s.cores; i++){CPU_SET(i, &cpuset);}
     if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end3);
 
-    // Pre-threading a pool of s.cnf.maxa Data Workers:
-    for(i=0; i<s.cnf.maxa; i++){if(pthread_create(&thread, NULL, W_Data, NULL) != 0) MyDBG(end3);}
+    // Pre-threading a pool of s.cnf.maxt Data Workers:
+    for(i=0; i<s.cnf.maxt; i++){if(pthread_create(&thread, NULL, W_Data, NULL) != 0) MyDBG(end3);}
 
     // Return on succes:
     pthread_exit(NULL);
@@ -206,7 +209,7 @@ void *W_Acce(void *arg)
 
 {
     // Initializations:
-    int i, clifd;                       // Socket file descriptor.
+    int i;                              // Socket file descriptor.
     struct sockaddr_in cliaddr;         // IPv4 socket address structure.
     socklen_t len = sizeof(cliaddr);    // Fixed length (16 bytes).
     PCLIENT cptr = NULL;                // Pointer to client data.
@@ -219,29 +222,26 @@ void *W_Acce(void *arg)
     while(1)
 
     {
-        // Blocking accept returns a non-blocking client socket:
-        if((clifd = accept(s.srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) MyDBG(end0);
-        if((i = fcntl(clifd, F_GETFL)) < 0) MyDBG(end1);
-        i |= O_NONBLOCK; if(fcntl(clifd, F_SETFL, i) < 0) MyDBG(end1);
-
         // Initialize the client data structure:
-        if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end1);
+        if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end0);
         cptr->epfd = (int)arg;
-        cptr->clifd = clifd;
+
+        // Blocking accept returns a non-blocking client socket:
+        if((cptr->clifd = accept(s.srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) MyDBG(end1);
+        if((i = fcntl(cptr->clifd, F_GETFL)) < 0) MyDBG(end2);
+        i |= O_NONBLOCK; if(fcntl(cptr->clifd, F_SETFL, i) < 0) MyDBG(end2);
 
         // Return data to us later:
         ev.data.ptr = (void *)cptr;
 
         // Epoll assignment:
-        if(epoll_ctl((int)arg, EPOLL_CTL_ADD, clifd, &ev) < 0) MyDBG(end2);
+        if(epoll_ctl((int)arg, EPOLL_CTL_ADD, cptr->clifd, &ev) < 0) MyDBG(end2);
         continue;
-
-        // Client error:
-        end2: free(cptr);
-        end1: close(clifd);
     }
 
     // Return on error:
+    end2: close(cptr->clifd);
+    end1: free(cptr);
     end0: pthread_exit(NULL);
 }
 
@@ -253,7 +253,7 @@ void *W_Wait(void *arg)
 
 {
     // Initializations:
-    int i, n;
+    int i, n;                            // For general use.
     struct epoll_event ev[s.cnf.maxe];   // Epoll-events array (C99).
 
     // Main thread loop:
@@ -276,7 +276,6 @@ void *W_Wait(void *arg)
 
                 // Get the pointer to the client data:
                 s.cli[s.iput] = (PCLIENT)(ev[i].data.ptr);
-                printf("[%d]\n", s.cli[s.iput]->clifd);
                 if(++s.iput == s.cnf.maxc){s.iput=0;}
                 if(s.iput == s.iget) MyDBG(end0);
 
@@ -301,7 +300,13 @@ void *W_Data(void *arg)
 
 {
     // Initializations:
-    PCLIENT cptr = NULL;
+    PCLIENT cptr = NULL;      // Pointer to client data.
+    char buff[MTU];           // Will store RX data.
+    int n, len;               // For general use.
+    struct epoll_event ev;    // Epoll event structure.
+
+    // Setup epoll behavior as one-shot-edge-triggered:
+    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
 
     // Main thread loop:
     while(1)
@@ -313,11 +318,43 @@ void *W_Data(void *arg)
         cptr = s.cli[s.iget]; if(++s.iget == s.cnf.maxc){s.iget=0;}
         if(pthread_mutex_unlock(&mtx) != 0) MyDBG(end0);
 
-        // Drain the socket:
+        // Try to non-blocking read some data until it would block or MTU:
+        len = 0; read: n = read(cptr->clifd, &buff, MTU-len);
+        if(n>0){len+=n; if(parser(buff, n, cptr) < 0){MyDBG(end0);} goto read;}
 
-        // Trigger re-arm:
+        // Ok, it would block or enough data readed for this round:
+        else if((n<0 && errno==EAGAIN) || (n==0 && len==MTU))
+
+        {
+            // Re-arm the trigger:
+            ev.data.ptr = (void *)cptr;
+            if(epoll_ctl(cptr->epfd, EPOLL_CTL_MOD, cptr->clifd, &ev) < 0) MyDBG(end0);
+        }
+
+        // The call was interrupted by a signal before any data was read:
+        else if(n<0 && errno==EINTR) goto read;
+
+        // End of connection:
+        else if(n<0)
+
+        {
+            if(epoll_ctl(cptr->epfd, EPOLL_CTL_DEL, cptr->clifd, NULL) < 0) MyDBG(end0);
+            close(cptr->clifd);
+            free(cptr);
+        }
     }
 
     // Return on error:
     end0: pthread_exit(NULL);
+}
+
+//-----------------------------------------------------------------------------
+// parser:
+//-----------------------------------------------------------------------------
+
+int parser(char *buff, int len, PCLIENT cptr)
+
+{
+    printf("[%d] %d bytes of data.\n", cptr->clifd, len);
+    return 0;
 }
