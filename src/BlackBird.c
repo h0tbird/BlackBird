@@ -28,8 +28,8 @@
 #include <stdio.h>
 #include <getopt.h>
 #include <sys/epoll.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <strings.h>
 #include <fcntl.h>
@@ -45,6 +45,7 @@
 #define MAX_CLIENTS 500         // Defaults for maxc.
 #define MAX_THREADS 50          // Defaults for maxt.
 #define MAX_EVENTS 50           // Defaults for maxe.
+#define TCP_NDELAY 0            // Defaukts for tcpd.
 #define LISTENP 8080            // Server listen port.
 #define LISTENQ 1024            // sysctl -w net.core.somaxconn=1024
 #define MTU 2896                // 2*(1500-40-12) per socket and round.
@@ -66,8 +67,9 @@ typedef struct _CONF
 
 {
     int maxc;    // Epoll size hint.
-    int maxt;    // Pre-threading hint.
+    int maxt;    // Pre-threading pool size.
     int maxe;    // Epoll events per round.
+    int tcpd;    // Control the Nagle algorithm.
 }
 
 CONF, *PCONF;
@@ -120,15 +122,17 @@ int main(int argc, char *argv[])
     s.cnf.maxc = MAX_CLIENTS;
     s.cnf.maxt = MAX_THREADS;
     s.cnf.maxe = MAX_EVENTS;
+    s.cnf.tcpd = TCP_NDELAY;
 
     // Parse command line options:
     struct option longopts[] = {
     { "max-clients",  required_argument,  NULL,  'c' },
     { "max-threads",  required_argument,  NULL,  't' },
     { "max-events",   required_argument,  NULL,  'e' },
+    { "tcp-nodelay",  no_argument,        NULL,  'n' },
     { 0, 0, 0, 0 }};
 
-    while((i = getopt_long(argc, argv, "c:a:e:", longopts, NULL)) != -1)
+    while((i = getopt_long(argc, argv, "c:t:e:n", longopts, NULL)) != -1)
 
     {
         if (i == -1) break;
@@ -141,6 +145,8 @@ int main(int argc, char *argv[])
             case 't': s.cnf.maxt = atoi(optarg);
                       break;
             case 'e': s.cnf.maxe = atoi(optarg);
+                      break;
+            case 'n': s.cnf.tcpd = 1;
                       break;
             default:  abort();
         }
@@ -228,6 +234,7 @@ void *W_Acce(void *arg)
 
         // Blocking accept returns a non-blocking client socket:
         if((cptr->clifd = accept(s.srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) MyDBG(end1);
+        if(s.cnf.tcpd){i=1; if(setsockopt(cptr->clifd, SOL_TCP, TCP_NODELAY, &i, sizeof(i)) < 0) MyDBG(end2);}
         if((i = fcntl(cptr->clifd, F_GETFL)) < 0) MyDBG(end2);
         i |= O_NONBLOCK; if(fcntl(cptr->clifd, F_SETFL, i) < 0) MyDBG(end2);
 
@@ -334,8 +341,11 @@ void *W_Data(void *arg)
         // The call was interrupted by a signal before any data was read:
         else if(n<0 && errno==EINTR) goto read;
 
-        // End of connection:
-        else if(n<0)
+        // Server has terminated:
+        else if(n<0 && errno==EBADF) free(cptr);
+
+        // Client has terminated:
+        else
 
         {
             if(epoll_ctl(cptr->epfd, EPOLL_CTL_DEL, cptr->clifd, NULL) < 0) MyDBG(end0);
@@ -355,6 +365,48 @@ void *W_Data(void *arg)
 int parser(char *buff, int len, PCLIENT cptr)
 
 {
-    printf("[%d] %d bytes of data.\n", cptr->clifd, len);
+    int i;
+    char resp[] = { 0x48, 0x54, 0x54, 0x50, 0x2f, 0x31, 0x2e, 0x31, 
+                    0x20, 0x32, 0x30, 0x30, 0x20, 0x4f, 0x4b, 0x0d, 
+                    0x0a, 0x44, 0x61, 0x74, 0x65, 0x3a, 0x20, 0x54, 
+                    0x68, 0x75, 0x2c, 0x20, 0x32, 0x34, 0x20, 0x46, 
+                    0x65, 0x62, 0x20, 0x32, 0x30, 0x31, 0x31, 0x20, 
+                    0x31, 0x35, 0x3a, 0x35, 0x31, 0x3a, 0x34, 0x31, 
+                    0x20, 0x47, 0x4d, 0x54, 0x0d, 0x0a, 0x53, 0x65, 
+                    0x72, 0x76, 0x65, 0x72, 0x3a, 0x20, 0x41, 0x70, 
+                    0x61, 0x63, 0x68, 0x65, 0x0d, 0x0a, 0x4c, 0x61, 
+                    0x73, 0x74, 0x2d, 0x4d, 0x6f, 0x64, 0x69, 0x66, 
+                    0x69, 0x65, 0x64, 0x3a, 0x20, 0x4d, 0x6f, 0x6e, 
+                    0x2c, 0x20, 0x31, 0x33, 0x20, 0x41, 0x75, 0x67, 
+                    0x20, 0x32, 0x30, 0x30, 0x37, 0x20, 0x31, 0x38, 
+                    0x3a, 0x34, 0x38, 0x3a, 0x33, 0x31, 0x20, 0x47, 
+                    0x4d, 0x54, 0x0d, 0x0a, 0x45, 0x54, 0x61, 0x67, 
+                    0x3a, 0x20, 0x22, 0x31, 0x63, 0x37, 0x38, 0x30, 
+                    0x33, 0x37, 0x2d, 0x62, 0x2d, 0x32, 0x62, 0x63, 
+                    0x39, 0x39, 0x64, 0x63, 0x30, 0x22, 0x0d, 0x0a, 
+                    0x41, 0x63, 0x63, 0x65, 0x70, 0x74, 0x2d, 0x52, 
+                    0x61, 0x6e, 0x67, 0x65, 0x73, 0x3a, 0x20, 0x62, 
+                    0x79, 0x74, 0x65, 0x73, 0x0d, 0x0a, 0x43, 0x6f, 
+                    0x6e, 0x74, 0x65, 0x6e, 0x74, 0x2d, 0x4c, 0x65, 
+                    0x6e, 0x67, 0x74, 0x68, 0x3a, 0x20, 0x31, 0x31, 
+                    0x0d, 0x0a, 0x43, 0x6f, 0x6e, 0x74, 0x65, 0x6e, 
+                    0x74, 0x2d, 0x54, 0x79, 0x70, 0x65, 0x3a, 0x20, 
+                    0x74, 0x65, 0x78, 0x74, 0x2f, 0x68, 0x74, 0x6d, 
+                    0x6c, 0x3b, 0x20, 0x63, 0x68, 0x61, 0x72, 0x73, 
+                    0x65, 0x74, 0x3d, 0x55, 0x54, 0x46, 0x2d, 0x38, 
+                    0x0d, 0x0a, 0x0d, 0x0a, 0x48, 0x65, 0x6c, 0x6c, 
+                    0x6f, 0x57, 0x6f, 0x72, 0x6c, 0x64, 0x0a };
+
+    for(i=0; i<len; i++)
+
+    {
+        if(buff[i]=='\x0d' && buff[i+1]=='\x0a' && buff[i+2]=='\x0d' && buff[i+3]=='\x0a')
+
+        {
+            write(cptr->clifd, resp, sizeof(resp));
+            break;
+        }
+    }
+
     return 0;
 }
