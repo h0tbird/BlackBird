@@ -24,3 +24,49 @@
 //-----------------------------------------------------------------------------
 
 #include "bb_fifo.h"
+
+//-----------------------------------------------------------------------------
+// bb_fifo_new:
+//-----------------------------------------------------------------------------
+
+int bb_fifo_new(PFIFO fifo)
+
+{
+    if((fifo->cap = malloc(sizeof(NODE))) == NULL) return 0;
+    fifo->cua = fifo->cap;
+    fifo->cua->nxt = NULL;
+    return 1;
+}
+
+//-----------------------------------------------------------------------------
+// bb_fifo_push:
+//-----------------------------------------------------------------------------
+
+int bb_fifo_push(PFIFO fifo, PCLIENT cptr)
+
+{
+    PNODE ptr;
+
+    if((ptr = malloc(sizeof(NODE))) == NULL) return 0;
+    ptr->cptr = cptr;
+    ptr->nxt = NULL;
+    fifo->cua->nxt = ptr;
+    fifo->cua = ptr;
+    return 1;
+}
+
+//-----------------------------------------------------------------------------
+// bb_fifo_pop:
+//-----------------------------------------------------------------------------
+
+int bb_fifo_pop(PFIFO fifo)
+
+{
+    PNODE ptr;
+
+    if(fifo->cap == fifo->cua) return 0;
+    ptr = fifo->cap;
+    fifo->cap = ptr->nxt;
+    free(ptr);
+    return 1;
+}

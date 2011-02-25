@@ -96,17 +96,6 @@ typedef struct _SERVER
 SERVER, *PSERVER;
 
 //-----------------------------------------------------------------------------
-// Prototypes:
-//-----------------------------------------------------------------------------
-
-void *W_Acce(void *arg);    // Acce Worker.
-void *W_Wait(void *arg);    // Wait Worker.
-void *W_Data(void *arg);    // Data Worker.
-void sig_int(int signo);    // Signal handler.
-
-int parser(char *buff, int len, PCLIENT cptr);
-
-//-----------------------------------------------------------------------------
 // End of include guard:
 //-----------------------------------------------------------------------------
 
