@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <getopt.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -94,6 +95,7 @@ SERVER, *PSERVER;
 void *W_Acce(void *arg);    // Acce Worker.
 void *W_Wait(void *arg);    // Wait Worker.
 void *W_Data(void *arg);    // Data Worker.
+void sig_int(int signo);    // Signal handler.
 
 int parser(char *buff, int len, PCLIENT cptr);
 
@@ -197,14 +199,27 @@ int main(int argc, char *argv[])
     // Pre-threading a pool of s.cnf.maxt Data Workers:
     for(i=0; i<s.cnf.maxt; i++){if(pthread_create(&thread, NULL, W_Data, NULL) != 0) MyDBG(end3);}
 
-    // Return on succes:
-    pthread_exit(NULL);
+    // Register a signal handler for SIGINT (Ctrl-C)
+    if((signal(SIGINT, sig_int)) == SIG_ERR) MyDBG(end3);
+
+    // Loop forever:
+    while(1){sleep(10);}
 
     // Return on error:
     end3: close(s.srvfd);
     end2: free(s.cli);
     end1: free(s.epfd);
     end0: return -1;
+}
+
+//-----------------------------------------------------------------------------
+// sig_int:
+//-----------------------------------------------------------------------------
+
+void sig_int(int signo)
+
+{
+    exit(EXIT_SUCCESS);
 }
 
 //-----------------------------------------------------------------------------
@@ -330,7 +345,7 @@ void *W_Data(void *arg)
         if(n>0){len+=n; if(parser(buff, n, cptr) < 0){MyDBG(end0);} goto read;}
 
         // Ok, it would block or enough data readed for this round:
-        else if((n<0 && errno==EAGAIN) || (n==0 && len==MTU))
+        else if(errno==EAGAIN || (n==0 && len==MTU))
 
         {
             // Re-arm the trigger:
@@ -338,20 +353,18 @@ void *W_Data(void *arg)
             if(epoll_ctl(cptr->epfd, EPOLL_CTL_MOD, cptr->clifd, &ev) < 0) MyDBG(end0);
         }
 
-        // The call was interrupted by a signal before any data was read:
-        else if(n<0 && errno==EINTR) goto read;
-
-        // Server has terminated:
-        else if(n<0 && errno==EBADF) free(cptr);
-
-        // Client has terminated:
-        else
+        else if(errno)
 
         {
-            if(epoll_ctl(cptr->epfd, EPOLL_CTL_DEL, cptr->clifd, NULL) < 0) MyDBG(end0);
-            close(cptr->clifd);
-            free(cptr);
+            // The call was interrupted by a signal before any data was read:
+            if(errno==EINTR) goto read;
+
+            // Server has closed the socket:
+            else if(errno==EBADF) free(cptr);
         }
+
+        // Client has terminated:
+        else {close(cptr->clifd); free(cptr);}
     }
 
     // Return on error:
