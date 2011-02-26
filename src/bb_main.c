@@ -160,7 +160,8 @@ void *W_Wait(void *arg)
 
     {
         // Wait up to s.cnf.maxe on the epoll-set:
-        if((n = epoll_wait((int)arg, &ev[0], s.cnf.maxe, -1)) < 0) MyDBG(end0);
+        wait: n = epoll_wait((int)arg, &ev[0], s.cnf.maxe, -1);
+        if(n<0){if(errno==EINTR){goto wait;} else{MyDBG(end0);}}
 
         // For each event fired: if the fd is available to be read from
         // without blocking, it is transfered to the Data Workers pool:
