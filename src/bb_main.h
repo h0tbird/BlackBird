@@ -43,6 +43,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <errno.h>
+#include "bb_fifo.h"
 
 //-----------------------------------------------------------------------------
 // Defines:
@@ -85,12 +86,11 @@ CONF, *PCONF;
 typedef struct _SERVER
 
 {
-    int srvfd;         // Server socket file descriptor.
-    int cores;         // Number of system cores.
-    int iput, iget;    // Indexes for the cli array.
-    int *epfd;         // Will point to an epfd array.
-    CONF cnf;          // Will store configuration options.
-    PCLIENT *cli;      // Will point to a pointer array.
+    int srvfd;     // Server socket file descriptor.
+    int cores;     // Number of system cores.
+    int *epfd;     // Will point to an epfd array.
+    CONF cnf;      // Will store configuration options.
+    FIFO fifo;     // This FIFO will store PCLIENTs.
 }
 
 SERVER, *PSERVER;

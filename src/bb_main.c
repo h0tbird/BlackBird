@@ -78,6 +78,7 @@ int parser(char *buff, int len, PCLIENT cptr)
         if(buff[i]=='\x0d' && buff[i+1]=='\x0a' && buff[i+2]=='\x0d' && buff[i+3]=='\x0a')
 
         {
+            //printf("[%d]\n", cptr->clifd);
             write(cptr->clifd, resp, sizeof(resp));
             break;
         }
@@ -108,8 +109,8 @@ void *W_Data(void *arg)
     {
         // Critical section:
         if(pthread_mutex_lock(&mtx) != 0) MyDBG(end0);
-        while(s.iget == s.iput){if(pthread_cond_wait(&cnd, &mtx) != 0) MyDBG(end0);}
-        cptr = s.cli[s.iget]; if(++s.iget == s.cnf.maxc){s.iget=0;}
+        while(bb_fifo_empty(&s.fifo)){if(pthread_cond_wait(&cnd, &mtx) != 0) MyDBG(end0);}
+        cptr = (PCLIENT)s.fifo.cap->nxt->cptr; bb_fifo_pop(&s.fifo);
         if(pthread_mutex_unlock(&mtx) != 0) MyDBG(end0);
 
         // Try to non-blocking read some data until it would block or MTU:
@@ -172,10 +173,8 @@ void *W_Wait(void *arg)
                 // Enter the critical section:
                 if(pthread_mutex_lock(&mtx) != 0) MyDBG(end0);
 
-                // Get the pointer to the client data:
-                s.cli[s.iput] = (PCLIENT)(ev[i].data.ptr);
-                if(++s.iput == s.cnf.maxc){s.iput=0;}
-                if(s.iput == s.iget) MyDBG(end0);
+                // Push the client-data pointer:
+                if(bb_fifo_push(&s.fifo, ev[i].data.ptr) < 0) MyDBG(end0);
 
                 // Signal to awake sleeping thread:
                 if(pthread_cond_signal(&cnd) != 0) MyDBG(end0);
@@ -294,15 +293,12 @@ int main(int argc, char *argv[])
 
     // Initialize server structures:
     s.cores = sysconf(_SC_NPROCESSORS_ONLN);
-    s.iput = s.iget = 0;
-
-    // Malloc epfd and client pointers:
     if((s.epfd = malloc(sizeof(int) * s.cores)) == NULL) MyDBG(end0);
-    if((s.cli = malloc(sizeof(PCLIENT) * s.cnf.maxc)) == NULL) MyDBG(end1);
+    if(bb_fifo_new(&s.fifo) < 0) MyDBG(end1);
 
     // Server blocking socket. Go ahead and reuse it:
-    if((s.srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end2);
-    i=1; if(setsockopt(s.srvfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end3);
+    if((s.srvfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) MyDBG(end1);
+    i=1; if(setsockopt(s.srvfd, SOL_SOCKET, SO_REUSEADDR, &i, sizeof(i)) < 0) MyDBG(end2);
 
     // Initialize srvaddr:
     bzero(&srvaddr, sizeof(srvaddr));
@@ -311,41 +307,40 @@ int main(int argc, char *argv[])
     srvaddr.sin_port = htons(LISTENP);
 
     // Bind and listen:
-    if(bind(s.srvfd, (struct sockaddr *) &srvaddr, sizeof(srvaddr)) < 0) MyDBG(end3);
-    if(listen(s.srvfd, LISTENQ) < 0) MyDBG(end3);
+    if(bind(s.srvfd, (struct sockaddr *) &srvaddr, sizeof(srvaddr)) < 0) MyDBG(end2);
+    if(listen(s.srvfd, LISTENQ) < 0) MyDBG(end2);
 
     // For each core in the system:
     for(i=0; i<s.cores; i++)
 
     {
         // Open an epoll fd dimensioned for s.cnf.maxc/s.cores descriptors:
-        if((s.epfd[i] = epoll_create(s.cnf.maxc/s.cores)) < 0) MyDBG(end3);
+        if((s.epfd[i] = epoll_create(s.cnf.maxc/s.cores)) < 0) MyDBG(end2);
 
         // New threads inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
-        if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end3);
+        if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end2);
 
         // Create the Acce Worker and the Wait Worker:
-        if(pthread_create(&thread, NULL, W_Acce, (void *) s.epfd[i]) != 0) MyDBG(end3);
-        if(pthread_create(&thread, NULL, W_Wait, (void *) s.epfd[i]) != 0) MyDBG(end3);
+        if(pthread_create(&thread, NULL, W_Acce, (void *) s.epfd[i]) != 0) MyDBG(end2);
+        if(pthread_create(&thread, NULL, W_Wait, (void *) s.epfd[i]) != 0) MyDBG(end2);
     }
 
     // Restore creator's (myself) affinity to all available cores:
     CPU_ZERO(&cpuset); for(i=0; i<s.cores; i++){CPU_SET(i, &cpuset);}
-    if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end3);
+    if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end2);
 
     // Pre-threading a pool of s.cnf.maxt Data Workers:
-    for(i=0; i<s.cnf.maxt; i++){if(pthread_create(&thread, NULL, W_Data, NULL) != 0) MyDBG(end3);}
+    for(i=0; i<s.cnf.maxt; i++){if(pthread_create(&thread, NULL, W_Data, NULL) != 0) MyDBG(end2);}
 
     // Register a signal handler for SIGINT (Ctrl-C)
-    if((signal(SIGINT, sig_int)) == SIG_ERR) MyDBG(end3);
+    if((signal(SIGINT, sig_int)) == SIG_ERR) MyDBG(end2);
 
     // Loop forever:
     while(1){sleep(10);}
 
     // Return on error:
-    end3: close(s.srvfd);
-    end2: free(s.cli);
+    end2: close(s.srvfd);
     end1: free(s.epfd);
     end0: return -1;
 }

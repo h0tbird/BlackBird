@@ -2,7 +2,7 @@
 # exports:
 #------------------------------------------------------------------------------
 
-export CFLAGS= -Wall -Werror
+export CFLAGS= -Wall -Werror -g
 export LFLAGS= -pthread
 export bin-dir= $(basedir)/usr/sbin
 export cfg-dir= $(basedir)/etc/BlackBird

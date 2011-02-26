@@ -30,7 +30,7 @@
 // Includes:
 //-----------------------------------------------------------------------------
 
-#include "bb_main.h"
+#include <stdlib.h>
 
 //-----------------------------------------------------------------------------
 // Typedefs:
@@ -38,7 +38,7 @@
 
 typedef struct _NODE {
 
-    PCLIENT         cptr;
+    void            *cptr;
     struct _NODE    *nxt;
 
 } NODE, *PNODE;
@@ -49,6 +49,15 @@ typedef struct _FIFO {
     PNODE    cua;
 
 } FIFO, *PFIFO;
+
+//-----------------------------------------------------------------------------
+// Prototypes:
+//-----------------------------------------------------------------------------
+
+int bb_fifo_new(PFIFO fifo);
+int bb_fifo_empty(PFIFO fifo);
+int bb_fifo_push(PFIFO fifo, void *cptr);
+void bb_fifo_pop(PFIFO fifo);
 
 //-----------------------------------------------------------------------------
 // End of include guard:
