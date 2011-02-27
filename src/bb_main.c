@@ -118,7 +118,7 @@ void *W_Data(void *arg)
         if(n>0){len+=n; if(parser(buff, n, cptr) < 0){MyDBG(end0);} goto read;}
 
         // Ok, it would block or enough data readed for this round:
-        else if(errno==EAGAIN || (n==0 && len==MTU))
+        else if((n<0 && errno==EAGAIN) || (n==0 && len==MTU))
 
         {
             // Re-arm the trigger:
@@ -126,15 +126,11 @@ void *W_Data(void *arg)
             if(epoll_ctl(cptr->epfd, EPOLL_CTL_MOD, cptr->clifd, &ev) < 0) MyDBG(end0);
         }
 
-        else if(errno)
+        // The call was interrupted by a signal before any data was read:
+        else if(n<0 && errno==EINTR) goto read;
 
-        {
-            // The call was interrupted by a signal before any data was read:
-            if(errno==EINTR) goto read;
-
-            // Server has closed the socket:
-            else if(errno==EBADF) free(cptr);
-        }
+        // Server has closed the socket:
+        else if(n<0 && errno==EBADF) free(cptr);
 
         // Client has terminated:
         else {close(cptr->clifd); free(cptr);}
