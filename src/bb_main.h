@@ -51,10 +51,11 @@
 
 #define MyDBG(x) do {printf("(%d) %s:%d\n", errno, __FILE__, __LINE__); goto x;} while (0)
 
-#define MAX_CLIENTS 500    // Defaults for maxc.
-#define MAX_THREADS 50     // Defaults for maxt.
-#define MAX_EVENTS 50      // Defaults for maxe.
-#define TCP_NDELAY 0       // Defaukts for tcpd.
+#define EPOLL_HINT 500     // Defaults for ehint.
+#define EPOLL_EVENTS 10    // Defaults for epoev.
+#define ACCEPT_THREADS 2   // Defaults for athre.
+#define DATA_THREADS 20    // Defaults for dthre.
+#define TCP_NDELAY 0       // Defaukts for tcpnd.
 #define LISTENP 8080       // Server listen port.
 #define LISTENQ 1024       // sysctl -w net.core.somaxconn=1024
 #define MTU 2896           // 2*(1500-40-12) per socket and round.
@@ -75,10 +76,11 @@ CLIENT, *PCLIENT;
 typedef struct _CONF
 
 {
-    int maxc;    // Epoll size hint.
-    int maxt;    // Pre-threading pool size.
-    int maxe;    // Epoll events per round.
-    int tcpd;    // Control the Nagle algorithm.
+    int ehint;   // Epoll size hint.
+    int epoev;   // Max epoll events per round.
+    int athre;   // Accept-threads per core.
+    int dthre;   // Data-threads pool size.
+    int tcpnd;   // Control the Nagle algorithm.
 }
 
 CONF, *PCONF;

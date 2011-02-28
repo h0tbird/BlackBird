@@ -148,15 +148,15 @@ void *W_Wait(void *arg)
 
 {
     // Initializations:
-    int i, n;                            // For general use.
-    struct epoll_event ev[s.cnf.maxe];   // Epoll-events array (C99).
+    int i, n;                             // For general use.
+    struct epoll_event ev[s.cnf.epoev];   // Epoll-events array (C99).
 
     // Main thread loop:
     while(1)
 
     {
-        // Wait up to s.cnf.maxe on the epoll-set:
-        wait: n = epoll_wait((int)arg, &ev[0], s.cnf.maxe, -1);
+        // Wait up to s.cnf.epoev on the epoll-set:
+        wait: n = epoll_wait((int)arg, &ev[0], s.cnf.epoev, -1);
         if(n<0){if(errno==EINTR){goto wait;} else{MyDBG(end0);}}
 
         // For each event fired: if the fd is available to be read from
@@ -179,6 +179,8 @@ void *W_Wait(void *arg)
                 // Leave the critical section:
                 if(pthread_mutex_unlock(&mtx) != 0) MyDBG(end0);
             }
+
+            else {printf("Event is not: EPOLLIN\n");}
         }
     }
 
@@ -213,7 +215,7 @@ void *W_Acce(void *arg)
 
         // Blocking accept returns a non-blocking client socket:
         if((cptr->clifd = accept(s.srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) MyDBG(end1);
-        if(s.cnf.tcpd){i=1; if(setsockopt(cptr->clifd, SOL_TCP, TCP_NODELAY, &i, sizeof(i)) < 0) MyDBG(end2);}
+        if(s.cnf.tcpnd){i=1; if(setsockopt(cptr->clifd, SOL_TCP, TCP_NODELAY, &i, sizeof(i)) < 0) MyDBG(end2);}
         if((i = fcntl(cptr->clifd, F_GETFL)) < 0) MyDBG(end2);
         i |= O_NONBLOCK; if(fcntl(cptr->clifd, F_SETFL, i) < 0) MyDBG(end2);
 
@@ -249,26 +251,28 @@ int main(int argc, char *argv[])
 
 {
     // Initializations:
-    int i;                         // For general use.
+    int i, j;                      // For general use.
     pthread_t thread;              // Main thread ID (myself).
     cpu_set_t cpuset;              // Each bit represents a CPU.
     struct sockaddr_in srvaddr;    // IPv4 socket address structure.
 
     // Set config defaults:
-    s.cnf.maxc = MAX_CLIENTS;
-    s.cnf.maxt = MAX_THREADS;
-    s.cnf.maxe = MAX_EVENTS;
-    s.cnf.tcpd = TCP_NDELAY;
+    s.cnf.ehint = EPOLL_HINT;
+    s.cnf.epoev = EPOLL_EVENTS;
+    s.cnf.athre = ACCEPT_THREADS;
+    s.cnf.dthre = DATA_THREADS;
+    s.cnf.tcpnd = TCP_NDELAY;
 
     // Parse command line options:
     struct option longopts[] = {
-    { "max-clients",  required_argument,  NULL,  'c' },
-    { "max-threads",  required_argument,  NULL,  't' },
-    { "max-events",   required_argument,  NULL,  'e' },
-    { "tcp-nodelay",  no_argument,        NULL,  'n' },
+    { "epoll-hint",     required_argument,  NULL,  'h' },
+    { "epoll-events",   required_argument,  NULL,  'e' },
+    { "accept-threads", required_argument,  NULL,  'a' },
+    { "data-threads",   required_argument,  NULL,  'd' },
+    { "tcp-nodelay",    no_argument,        NULL,  'n' },
     { 0, 0, 0, 0 }};
 
-    while((i = getopt_long(argc, argv, "c:t:e:n", longopts, NULL)) != -1)
+    while((i = getopt_long(argc, argv, "h:e:a:d:n", longopts, NULL)) != -1)
 
     {
         if (i == -1) break;
@@ -276,13 +280,15 @@ int main(int argc, char *argv[])
         switch(i)
 
         {
-            case 'c': s.cnf.maxc = atoi(optarg);
+            case 'h': s.cnf.ehint = atoi(optarg);
                       break;
-            case 't': s.cnf.maxt = atoi(optarg);
+            case 'e': s.cnf.epoev = atoi(optarg);
                       break;
-            case 'e': s.cnf.maxe = atoi(optarg);
+            case 'a': s.cnf.athre = atoi(optarg);
                       break;
-            case 'n': s.cnf.tcpd = 1;
+            case 'd': s.cnf.dthre = atoi(optarg);
+                      break;
+            case 'n': s.cnf.tcpnd = 1;
                       break;
             default:  abort();
         }
@@ -311,24 +317,31 @@ int main(int argc, char *argv[])
     for(i=0; i<s.cores; i++)
 
     {
-        // Open an epoll fd dimensioned for s.cnf.maxc/s.cores descriptors:
-        if((s.epfd[i] = epoll_create(s.cnf.maxc/s.cores)) < 0) MyDBG(end2);
+        // Open an epoll fd dimensioned for s.cnf.ehint/s.cores descriptors:
+        if((s.epfd[i] = epoll_create(s.cnf.ehint/s.cores)) < 0) MyDBG(end2);
 
-        // New threads inherits a copy of its creator's CPU affinity mask:
+        // Wait-Worker inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
         if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end2);
-
-        // Create the Acce Worker and the Wait Worker:
-        if(pthread_create(&thread, NULL, W_Acce, (void *) s.epfd[i]) != 0) MyDBG(end2);
         if(pthread_create(&thread, NULL, W_Wait, (void *) s.epfd[i]) != 0) MyDBG(end2);
     }
+
+    // Round-Robin distribution of Accept-Workers among all available cores:
+    for (j=0; j<s.cnf.athre; j++){for (i=0; i<s.cores; i++)
+
+    {
+        // Accept-Worker inherits a copy of its creator's CPU affinity mask:
+        CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
+        if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end2);
+        if(pthread_create(&thread, NULL, W_Acce, (void *) s.epfd[i]) != 0) MyDBG(end2);
+    }}
 
     // Restore creator's (myself) affinity to all available cores:
     CPU_ZERO(&cpuset); for(i=0; i<s.cores; i++){CPU_SET(i, &cpuset);}
     if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end2);
 
-    // Pre-threading a pool of s.cnf.maxt Data Workers:
-    for(i=0; i<s.cnf.maxt; i++){if(pthread_create(&thread, NULL, W_Data, NULL) != 0) MyDBG(end2);}
+    // Pre-threading a pool of s.cnf.dthre Data-Workers:
+    for(i=0; i<s.cnf.dthre; i++){if(pthread_create(&thread, NULL, W_Data, NULL) != 0) MyDBG(end2);}
 
     // Register a signal handler for SIGINT (Ctrl-C)
     if((signal(SIGINT, sig_int)) == SIG_ERR) MyDBG(end2);
