@@ -156,7 +156,7 @@ void *W_Wait(void *arg)
 
     {
         // Wait up to s.cnf.epoev on the epoll-set:
-        wait: n = epoll_wait((int)arg, &ev[0], s.cnf.epoev, -1);
+        wait: n = epoll_wait((intptr_t)arg, &ev[0], s.cnf.epoev, -1);
         if(n<0){if(errno==EINTR){goto wait;} else{MyDBG(end0);}}
 
         // For each event fired: if the fd is available to be read from
@@ -211,7 +211,7 @@ void *W_Acce(void *arg)
     {
         // Initialize the client data structure:
         if((cptr = malloc(sizeof(CLIENT))) == NULL) MyDBG(end0);
-        cptr->epfd = (int)arg;
+        cptr->epfd = (intptr_t)arg;
 
         // Blocking accept returns a non-blocking client socket:
         if((cptr->clifd = accept(s.srvfd, (struct sockaddr *) &cliaddr, &len)) < 0) MyDBG(end1);
@@ -223,7 +223,7 @@ void *W_Acce(void *arg)
         ev.data.ptr = (void *)cptr;
 
         // Epoll assignment:
-        if(epoll_ctl((int)arg, EPOLL_CTL_ADD, cptr->clifd, &ev) < 0) MyDBG(end2);
+        if(epoll_ctl((intptr_t)arg, EPOLL_CTL_ADD, cptr->clifd, &ev) < 0) MyDBG(end2);
         continue;
     }
 
@@ -323,7 +323,7 @@ int main(int argc, char *argv[])
         // Wait-Worker inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
         if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end2);
-        if(pthread_create(&thread, NULL, W_Wait, (void *) s.epfd[i]) != 0) MyDBG(end2);
+        if(pthread_create(&thread, NULL, W_Wait, (void *)(intptr_t)s.epfd[i]) != 0) MyDBG(end2);
     }
 
     // Round-Robin distribution of Accept-Workers among all available cores:
@@ -333,7 +333,7 @@ int main(int argc, char *argv[])
         // Accept-Worker inherits a copy of its creator's CPU affinity mask:
         CPU_ZERO(&cpuset); CPU_SET(i, &cpuset);
         if(pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) MyDBG(end2);
-        if(pthread_create(&thread, NULL, W_Acce, (void *) s.epfd[i]) != 0) MyDBG(end2);
+        if(pthread_create(&thread, NULL, W_Acce, (void *)(intptr_t)s.epfd[i]) != 0) MyDBG(end2);
     }}
 
     // Restore creator's (myself) affinity to all available cores:
