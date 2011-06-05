@@ -2,8 +2,8 @@
 # all:
 #------------------------------------------------------------------------------
 
-all:		bb_main bb_fifo
-		gcc $(CFLAGS) bb_main.o bb_fifo.o $(LFLAGS) -o ../bin/bb
+all:		bb_main bb_daemon bb_fifo
+		gcc $(CFLAGS) bb_main.o bb_daemon.o bb_fifo.o $(LFLAGS) -o ../bin/bb
 		rm -f *.o	
 
 #------------------------------------------------------------------------------
@@ -12,6 +12,13 @@ all:		bb_main bb_fifo
 
 bb_main:	bb_main.o
 		gcc $(CFLAGS) -c bb_main.c
+
+#------------------------------------------------------------------------------
+# bb_daemon:
+#------------------------------------------------------------------------------
+
+bb_daemon:	bb_daemon.o
+		gcc $(CFLAGS) -c bb_daemon.c
 
 #------------------------------------------------------------------------------
 # bb_fifo:

@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include "bb_fifo.h"
+#include "bb_daemon.h"
 
 //-----------------------------------------------------------------------------
 // Defines:

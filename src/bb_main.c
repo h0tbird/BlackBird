@@ -294,6 +294,9 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Daemonize:
+    daemonize();
+
     // Initialize server structures:
     s.cores = sysconf(_SC_NPROCESSORS_ONLN);
     if((s.epfd = malloc(sizeof(int) * s.cores)) == NULL) MyDBG(end0);
