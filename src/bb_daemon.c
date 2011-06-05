@@ -32,5 +32,22 @@
 void daemonize(void)
 
 {
+    pid_t pid;
 
+    // Already a daemon:
+    if(getppid() == 1) return;
+
+    // Forking the parent process:
+    if((pid = fork()) < 0) exit(1);
+    if(pid > 0) exit(0);
+
+    // Setting up the environment:
+    umask(0);
+    if(setsid() < 0) exit(1);
+    if((chdir("/")) < 0) exit(1);
+
+    // Close the std file descriptors:
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
 }
