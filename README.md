@@ -15,10 +15,10 @@ High-performance, high-scalable, epoll-based, edge-triggered, non-blocking, pre-
     |        \__________________ __________________/        |    | A |  Accept worker.
     |                           V                           |    +---+
     |                         +---+                         |
-    |       CORE1             | M |             CORE2       |    +---+
+    |       CORE1 <-----------| M |-----------> CORE2       |    +---+
     |  _______^_______        +---+        _______^_______  |    | W |  Wait worker.
-    | /               \                   /               \ |    +---+
-    |     *······*                             *······*     |
+    | /               \         |         /               \ |    +---+
+    |     *······*              V              *······*     |
     |   +-| epfd |           *·····*           | epfd |-+   |    +---+
     |   | *······*           | sfd |           *······* |   |    | D |  Data worker.
     |   |     ^              *·····*              ^     |   |    +---+
