@@ -2,9 +2,9 @@
 # all:
 #------------------------------------------------------------------------------
 
-all:	bb_main bb_fifo
-	gcc $(CFLAGS) bb_main.o bb_fifo.o $(LFLAGS) -o ../bin/bb
-	rm -f *.o	
+all:		bb_main bb_fifo
+		gcc $(CFLAGS) bb_main.o bb_fifo.o $(LFLAGS) -o ../bin/bb
+		rm -f *.o	
 
 #------------------------------------------------------------------------------
 # bb_main:
@@ -25,13 +25,13 @@ bb_fifo:	bb_fifo.o
 #------------------------------------------------------------------------------
 
 clean:
-	rm -f *.o
-	rm -f ../bin/bb
+		rm -f *.o
+		rm -f ../bin/bb
 
 #------------------------------------------------------------------------------
 # install:
 #------------------------------------------------------------------------------
 
 install:
-	mkdir -p $(bin-dir)
-	install -m755 ../bin/bb $(bin-dir)
+		mkdir -p $(bin-dir)
+		install -m755 ../bin/bb $(bin-dir)
